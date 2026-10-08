@@ -1,6 +1,6 @@
 import {sameOrigin} from '@/lib/request';
 import {getUser} from '@/lib/auth';
-import {getPost,previousTitles,reservePost,updatePost,saveReview,getRevision,revisePost} from '@/lib/store';
+import {getPost,previousTitles,reservePost,updatePost,saveReview,getRevision,revisePost,importLegacyPosts} from '@/lib/store';
 export const runtime='nodejs';
 export const maxDuration=300;
 import {catalog,imageById} from '@/lib/hub';
@@ -13,6 +13,7 @@ export async function POST(req:Request){
  let body:Record<string,unknown>;try{body=await req.json();}catch{return Response.json({error:'요청 형식 오류'},{status:400});}
  const action=String(body.action||'');const key=typeof body.key==='string'?body.key:undefined;const now=new Date().toISOString();let workingPost:Awaited<ReturnType<typeof getPost>>=null;
  try{
+ if(action==='importLegacy')return Response.json(await importLegacyPosts(user.userId));
  if(action==='topics'){
   const theme=String(body.theme);if(!THEMES.some(t=>t.id===theme))throw new Error('테마를 선택해 주세요.');
   const images=await catalog();if(images.length<2)throw new Error('공개 이미지가 2개 이상 필요합니다. 이미지허브에서 공개 설정을 확인해 주세요.');

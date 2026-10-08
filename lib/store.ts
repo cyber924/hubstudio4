@@ -2,6 +2,9 @@ import 'server-only';
 import {getUser} from './auth';
 import {CONTENT_API,FIREBASE_WEB_API_KEY} from './config';
 import type {Post,Article} from './types';
+import legacyPosts from '@/migration/public-posts.json';
+
+export function hasLegacyPosts(owner:string){return legacyPosts.length>0&&legacyPosts.every(p=>p.owner===owner);}
 
 type Value={stringValue?:string;integerValue?:string;nullValue?:null};
 type Doc={name:string;fields:Record<string,Value>;updateTime:string};
@@ -72,6 +75,38 @@ export async function reservePost(owner:string,theme:string,title:string){
   const post:Post={id,owner,theme,title,description:'',content:'',status:'reserved',created:now,updated:now,published:null,review:null,version:0};
   try{await call(':commit',user.token,{writes:[write('hub4Counters/posts',{nextId:id,updated:now},c?{updateTime:c.updateTime}:{exists:false}),write(collection+'/'+id,values(post),{exists:false})]});return id;}catch(e){if(!(e instanceof DBError&&[409,412].includes(e.status)))throw e;}
  }throw new Error('동시에 글 번호를 확보하는 요청이 많습니다. 다시 시도해 주세요.');
+}
+// One-time import under the original author's Firebase session. Never overwrite
+// completed, edited, unpublished or deleted posts, and never remap their IDs.
+export async function importLegacyPosts(owner:string){
+ if(!hasLegacyPosts(owner))throw new Error('기존 글 작성자 계정으로 로그인해 주세요.');
+ const user=await identity(owner);
+ const rows=await call(':runQuery',user.token,{structuredQuery:{from:[{collectionId:collection}],where:{fieldFilter:{field:{fieldPath:'owner'},op:'EQUAL',value:{stringValue:owner}}}}}) as {document?:Doc}[];
+ const existing=new Map(rows.filter(x=>x.document).map(x=>{const d=x.document!;const p={...decode(d),review:null,updateTime:d.updateTime} as Stored;return [p.id,p];}));
+ const backup=[...legacyPosts].sort((a,b)=>a.id-b.id);
+ // Preflight all conflicts before importing the first article.
+ for(const row of backup){const p=existing.get(row.id);if(p&&(p.created!==row.created||p.theme!==row.theme||(p.version===0&&p.status!=='reserved')))throw new Error('기존 글과 번호가 충돌합니다. 저장된 글을 덮어쓰지 않았습니다. 번호 '+row.id);}
+ let imported=0;let skipped=0;
+ for(const row of backup){
+  let p=existing.get(row.id);if(p&&p.version>=1){skipped++;continue;}
+  if(!p){
+   for(let attempt=0;attempt<5;attempt++){
+    const counter=await doc('hub4Counters/posts',user.token);const next=counter?Number(decode(counter).nextId)+1:1;
+    if(next!==row.id){
+     // Another tab may have imported this ID while we were running.
+     const current=await doc(collection+'/'+row.id,user.token);
+     if(current){const q={...decode(current),review:null,updateTime:current.updateTime} as Stored;if(q.owner===owner&&q.created===row.created&&q.theme===row.theme){p=q;break;}}
+     throw new Error('글 번호 카운터가 백업과 다릅니다. 기존 글은 덮어쓰지 않았습니다.');
+    }
+    const reserved:Post={id:row.id,owner,theme:row.theme,title:row.title,description:'',content:'',status:'reserved',created:row.created,updated:row.updated,published:null,review:null,version:0};
+    try{const result=await call(':commit',user.token,{writes:[write('hub4Counters/posts',{nextId:row.id,updated:new Date().toISOString()},counter?{updateTime:counter.updateTime}:{exists:false}),write(collection+'/'+row.id,values(reserved),{exists:false})]}) as {writeResults:{updateTime:string}[]};p={...reserved,updateTime:result.writeResults[1].updateTime};break;}catch(error){if(!(error instanceof DBError&&[409,412].includes(error.status)))throw error;}
+   }
+  }
+  if(!p)throw new Error('동시 이전 요청이 많습니다. 잠시 후 다시 시도해 주세요.');
+  if(p.version>=1){skipped++;continue;}
+  await updatePost(p,{title:row.title,description:row.description,content:JSON.stringify(row.article),status:'published',created:row.created,updated:row.updated,published:row.published,version:1});imported++;
+ }
+ return {imported,skipped,total:backup.length};
 }
 export async function updatePost(post:Stored,patch:Partial<Post>){const user=await identity(post.owner);const next={...post,...patch};const {updateTime,...p}=next;const result=await call(':commit',user.token,{writes:[write(collection+'/'+post.id,values(p),{updateTime:post.updateTime})]}) as {writeResults:{updateTime:string}[]};return {...next,updateTime:result.writeResults[0].updateTime};}
 export async function saveReview(post:Stored,review:unknown){const user=await identity(post.owner);await call(':commit',user.token,{writes:[write(collection+'/'+post.id,values(post),{updateTime:post.updateTime}),write(collection+'/'+post.id+'/private/review',{content:JSON.stringify(review)})]});}
