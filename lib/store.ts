@@ -11,16 +11,18 @@ const collection='hub4Posts';
 const encode=(x:unknown):Value=>x==null?{nullValue:null}:typeof x==='number'?{integerValue:String(x)}:{stringValue:String(x)};
 const fields=(x:Record<string,unknown>)=>Object.fromEntries(Object.entries(x).map(([k,v])=>[k,encode(v)]));
 const decode=(d:Doc)=>Object.fromEntries(Object.entries(d.fields).map(([k,v])=>[k,v.integerValue!==undefined?Number(v.integerValue):v.stringValue??null]));
-class DBError extends Error{constructor(public status:number,message:string){super(message);}}
+class DBError extends Error{constructor(public status:number,message:string,public missingIndex=false){super(message);}}
+export function storageErrorMessage(error:unknown){return error instanceof DBError?error.message:'저장소 연결을 확인한 뒤 다시 시도해 주세요.';}
 async function call(path:string,token?:string,body?:unknown){
  const r=await fetch(CONTENT_API+path+('?key='+encodeURIComponent(FIREBASE_WEB_API_KEY)),{method:body===undefined?'GET':'POST',headers:{'Content-Type':'application/json',...(token?{Authorization:'Bearer '+token}:{})},body:body===undefined?undefined:JSON.stringify(body),cache:'no-store',signal:AbortSignal.timeout(20000)});
- if(!r.ok){const payload=await r.json().catch(()=>null) as {error?:{status?:string}}|null;const status=path===':commit'&&payload?.error?.status==='FAILED_PRECONDITION'?409:r.status;const messages:Record<number,string>={403:'글 저장소 권한 오류입니다. Firestore의 허브스튜디오4 규칙을 적용해 주세요.',401:'로그인이 만료됐습니다. 다시 로그인해 주세요.',409:'다른 요청에서 글이 변경되었습니다. 새로고침 후 다시 시도해 주세요.',412:'다른 요청에서 글이 변경되었습니다. 새로고침 후 다시 시도해 주세요.'};throw new DBError(status,messages[status]||'글 저장소 연결 실패 ('+r.status+').');}return r.json();
+ const raw=await r.json().catch(()=>null);const payload=Array.isArray(raw)?raw.find(x=>x?.error):raw;
+ if(!r.ok||payload?.error){const error=payload?.error as {code?:number;status?:string;message?:string}|undefined;const code=error?.code||r.status;const status=path===':commit'&&error?.status==='FAILED_PRECONDITION'?409:code;const missingIndex=error?.status==='FAILED_PRECONDITION'&&/index/i.test(error.message||'');const messages:Record<number,string>={403:'Firebase가 공개 글 읽기를 거절했습니다. Firestore 규칙에서 hub4Posts의 published 글에 비로그인 조회를 허용해 주세요.',401:'로그인이 만료됐습니다. 다시 로그인해 주세요.',409:'다른 요청에서 글이 변경되었습니다. 새로고침 후 다시 시도해 주세요.',412:'다른 요청에서 글이 변경되었습니다. 새로고침 후 다시 시도해 주세요.'};console.error('[hub4:firestore]',{operation:path,status,code:error?.status,missingIndex});throw new DBError(status,messages[status]||'글 저장소 연결 실패 ('+code+').',missingIndex);}return raw;
 }
 async function identity(owner:string){const user=await getUser();if(!user||user.userId!==owner)throw new Error('내 글 관리 권한이 없습니다.');return user;}
 async function doc(path:string,token?:string):Promise<Doc|null>{try{return await call('/'+path,token) as Doc;}catch(e){if(e instanceof DBError&&e.status===404)return null;throw e;}}
 const write=(path:string,data:Record<string,unknown>,condition?:Record<string,unknown>)=>({update:{name:root+'/'+path,fields:fields(data)},...(condition?{currentDocument:condition}:{})});
 function values(p:Post&{updateTime?:string}){const {review,updateTime,...data}=p;return data;}
-async function queryPosts(owner?:string,metadata=false):Promise<Stored[]>{
+async function indexedPosts(owner?:string,metadata=false):Promise<Stored[]>{
  const token=owner?(await identity(owner)).token:undefined;const output:Stored[]=[];let last:number|undefined;
  for(let page=0;page<50;page++){
   const filter={fieldFilter:{field:{fieldPath:owner?'owner':'status'},op:'EQUAL',value:{stringValue:owner||'published'}}};
@@ -29,16 +31,30 @@ async function queryPosts(owner?:string,metadata=false):Promise<Stored[]>{
   if(docs.length<200)return output;last=output[output.length-1].id;
  }throw new Error('조회 범위를 초과했습니다. 저장소 페이지 설정을 확인해 주세요.');
 }
+// Preserve the publication/owner constraint on every page; no private-data fallback.
+async function unindexedPosts(owner?:string,metadata=false):Promise<Stored[]>{
+ const token=owner?(await identity(owner)).token:undefined;const output:Stored[]=[];let last:string|undefined;
+ for(let page=0;page<50;page++){
+  const rows=await call(':runQuery',token,{structuredQuery:{from:[{collectionId:collection}],...(metadata?{select:{fields:[{fieldPath:'id'},{fieldPath:'updated'}]}}:{}),where:{fieldFilter:{field:{fieldPath:owner?'owner':'status'},op:'EQUAL',value:{stringValue:owner||'published'}}},limit:200,...(last?{startAt:{values:[{referenceValue:last}],before:false}}:{})}}) as {document?:Doc}[];
+  const docs=rows.filter(x=>x.document).map(x=>x.document!);for(const d of docs)output.push({...decode(d),review:null,updateTime:d.updateTime} as Stored);
+  if(docs.length<200)return output.sort((a,b)=>b.id-a.id);last=docs[docs.length-1].name;
+ }throw new Error('조회 범위를 초과했습니다. 저장소 페이지 설정을 확인해 주세요.');
+}
+async function queryPosts(owner?:string,metadata=false):Promise<Stored[]>{
+ try{return await indexedPosts(owner,metadata);}catch(error){if(!(error instanceof DBError&&error.missingIndex))throw error;return unindexedPosts(owner,metadata);}
+}
 export async function publicPosts(){return queryPosts(undefined,true);}
 export async function listPosts(options:{owner?:string;theme?:string;q?:string;page?:number}={}){
  const page=Math.max(1,Math.floor(options.page||1));
  if(!options.owner&&!options.q){
+  try{
   const status={fieldFilter:{field:{fieldPath:'status'},op:'EQUAL',value:{stringValue:'published'}}};
   const where=options.theme?{compositeFilter:{op:'AND',filters:[status,{fieldFilter:{field:{fieldPath:'theme'},op:'EQUAL',value:{stringValue:options.theme}}}]}}:status;
   const base={from:[{collectionId:collection}],where};
   const [rows,count]=await Promise.all([call(':runQuery',undefined,{structuredQuery:{...base,orderBy:[{field:{fieldPath:'id'},direction:'DESCENDING'}],limit:12,offset:(page-1)*12}}),call(':runAggregationQuery',undefined,{structuredAggregationQuery:{structuredQuery:base,aggregations:[{count:{},alias:'total'}]}})]);
   const docs=(rows as {document?:Doc}[]).filter(x=>x.document).map(x=>({...decode(x.document!),review:null,updateTime:x.document!.updateTime} as Stored));
   const total=Number((count as {result?:{aggregateFields?:{total?:Value}}}[])[0]?.result?.aggregateFields?.total?.integerValue||0);return {posts:docs,total,page};
+  }catch(error){if(!(error instanceof DBError&&error.missingIndex))throw error;}
  }
  let posts=(await queryPosts(options.owner)).filter(p=>p.status!=='deleted');if(options.theme)posts=posts.filter(p=>p.theme===options.theme);if(options.q){const q=options.q.toLocaleLowerCase();posts=posts.filter(p=>(p.title+' '+p.description).toLocaleLowerCase().includes(q));}
  return {posts:posts.slice((page-1)*12,page*12),total:posts.length,page};
