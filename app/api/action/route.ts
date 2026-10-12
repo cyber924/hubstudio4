@@ -3,6 +3,7 @@ import {getUser} from '@/lib/auth';
 import {getPost,previousTitles,reservePost,updatePost,saveReview,getRevision,revisePost,importLegacyPosts} from '@/lib/store';
 export const runtime='nodejs';
 export const maxDuration=300;
+import {validateImageSelection} from '@/lib/image-selection';
 import {catalog,imageById} from '@/lib/hub';
 import {ai,articleFormat,validateArticle} from '@/lib/ai';
 import {THEMES,themeName,type Article,type ImageAsset,type Review} from '@/lib/types';
@@ -34,8 +35,15 @@ export async function POST(req:Request){
   const count=Number(body.count);if(![2,3,4,5].includes(count))throw new Error('이미지 수는 2~5개입니다.');
   post=await updatePost(post,{status:'generating',updated:now});workingPost=post;
   const images=await catalog();if(images.length<count)throw new Error('공개 이미지 수가 부족합니다. 이미지 수를 줄이거나 이미지허브에서 공개해 주세요.');
-  const select=await ai('주제에 정확히 맞는 이미지 '+count+'개를 다음 전체 이미지허브 자산 중 선택. 중복 없이 실제 ID 사용. 관련성이 낮으면 억지로 선택하지 말고 {"error":"적합한 이미지가 부족합니다"} 반환. 제목:'+post.title+'\n'+JSON.stringify(images.map(({data,url,...x})=>x))+'\nJSON {"imageIds":["id"]}',key);
-  if(select.error)throw new Error(String(select.error));const ids=select.imageIds as string[];if(!Array.isArray(ids)||new Set(ids).size!==count||!ids.every(x=>images.some(a=>a.id===x)))throw new Error('주제에 맞는 이미지 '+count+'개를 선택하지 못했습니다.');
+  let ids:string[];
+  if(body.imageIds!==undefined){
+   // A user's explicit choice takes precedence over AI selection.
+   ids=validateImageSelection(body.imageIds,images,count);
+  }else{
+   const select=await ai('주제에 가장 가까운 이미지 '+count+'개를 다음 전체 이미지허브 자산 중 선택. 중복 없이 실제 ID를 정확히 사용. 제목과 완전히 동일한 사진이 없어도 주제를 표현할 수 있는 이미지로 구성하고, 사진에 없는 구체적인 장소나 제품을 추측하지 않는다. 제목:'+post.title+'\n'+JSON.stringify(images.map(({data,url,...x})=>x))+'\nJSON {"imageIds":["id"]}',key);
+   if(select.error)throw new Error(String(select.error)+' 이미지허브에서 직접 선택한 뒤 다시 생성해 주세요.');
+   ids=validateImageSelection(select.imageIds,images,count);
+  }
   const assets=(await Promise.all(ids.map(imageById))).filter((x):x is ImageAsset=>!!x);if(assets.length!==count)throw new Error('선택한 이미지 중 공개 상태가 변경되거나 사용할 수 없는 이미지가 있습니다.');
   const result=await ai('한국어 전문 웹진 글을 작성. 주제:'+post.title+'\n테마:'+themeName(post.theme)+'\n문체:'+String(body.tone||'친근한 정보형')+'\n추가 요청:'+String(body.directions||'').slice(0,600)+'\n이미지:'+JSON.stringify(assets.map(({data,url,...x})=>x))+'\n각 이미지에 한 섹션을 배정하고 총 '+count+'개 섹션, 섹션마다 2~3개의 충분한 문단. 사진에 실제 보이는 내용에 맞춰 글을 구성. 이미지와 관계없는 장소명·가격·운영시간·통계·최신사실·직접 체험을 지어내지 않는다. 사실 확인이 필요한 내용은 독자가 확인할 방법을 설명한다. 외부 출처 URL을 만들지 않는다. 제목 45자 이내, description 80~140자, 전체 1200~2000자. Markdown·HTML을 넣지 말고 순수 텍스트. 정확한 JSON:'+articleFormat,key,assets);
   const article=validateArticle(result,assets,count);await updatePost(post,{title:article.title,description:article.description,content:JSON.stringify(article),status:'published',published:new Date().toISOString(),updated:new Date().toISOString(),version:1});workingPost=null;return Response.json({id,title:article.title});
