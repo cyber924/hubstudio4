@@ -1,4 +1,5 @@
-export const ORIGIN=(process.env.SITE_URL||('https://'+(process.env.VERCEL_PROJECT_PRODUCTION_URL||process.env.VERCEL_URL||'hubstudio4.vercel.app'))).replace(/\/$/,'');
+// Activate https://hubcloud.co.kr through SITE_URL after DNS and HTTPS are valid.
+export const ORIGIN=(process.env.SITE_URL||'https://hubstudio4.vercel.app').replace(/\/$/,'');
 export const HUB_PROJECT=process.env.FIREBASE_PROJECT_ID||'studio-9240700230-1dd9a';
 export const HUB_API='https://firestore.googleapis.com/v1/projects/'+HUB_PROJECT+'/databases/(default)/documents';
 export const CONTENT_API=HUB_API;
