@@ -4,7 +4,7 @@ export async function ai(prompt:string,key?:string,images:ImageAsset[]=[]){
  if(!k)throw new Error('Gemini API 키를 입력해 주세요. 입력한 키는 저장하지 않습니다.');
  const parts:unknown[]=[{text:prompt}];
  for(const a of images){if(a.data?.startsWith('data:image/')){const m=a.data.match(/^data:([^;]+);base64,([\s\S]+)$/);if(m){parts.push({text:'다음 사진 ID: '+a.id});parts.push({inlineData:{mimeType:m[1],data:m[2]}});}}}
- const model=process.env.GEMINI_MODEL||'gemini-2.5-flash';
+ const model='gemini-3.5-flash';
  const r=await fetch('https://generativelanguage.googleapis.com/v1beta/models/'+encodeURIComponent(model)+':generateContent',{method:'POST',headers:{'Content-Type':'application/json','x-goog-api-key':k},body:JSON.stringify({contents:[{parts}],generationConfig:{responseMimeType:'application/json',temperature:0.65}}),signal:AbortSignal.timeout(120000)});
  const d=await r.json() as {candidates?:{content?:{parts?:{text?:string}[]}}[];error?:{message?:string}};
  if(!r.ok)throw new Error(r.status===429?'Gemini 요청 한도에 도달했습니다. 잠시 후 다시 시도하세요.':'Gemini 응답 오류 ('+r.status+'). API 키와 모델 사용 권한을 확인해 주세요.');
